@@ -4,10 +4,10 @@ sys.path.insert(0, '.')
 from model import MultiPathFusionNet
 import torch
 
-# Test model architecture with correct 4-channel input
-model = MultiPathFusionNet(in_channels=4, num_classes=4)
+# Test model architecture with correct 1-channel input, 2-class output
+model = MultiPathFusionNet(in_channels=1, num_classes=2)
 model.eval()
-x = torch.randn(1, 4, 256, 256)
+x = torch.randn(1, 1, 256, 256)
 with torch.no_grad():
     y = model(x)
 params = sum(p.numel() for p in model.parameters())

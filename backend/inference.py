@@ -29,12 +29,10 @@ IMG_SIZE = 256
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WEIGHTS_PATH = Path(__file__).parent / "models" / "best_model.pth"
 
-# Tumor class colors: 0=BG, 1=Whole(green), 2=Core(orange), 3=Enhancing(yellow)
+# Tumor class colors: 0=BG, 1=Tumor(green)
 CLASS_COLORS = {
     0: (0,   0,   0,   0),    # Background – transparent
-    1: (0,   200, 80,  160),  # Whole Tumor – green
-    2: (255, 140, 0,   160),  # Tumor Core  – orange
-    3: (255, 230, 0,   160),  # Enhancing   – yellow
+    1: (0,   200, 80,  160),  # Tumor – green
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -51,7 +49,7 @@ def get_model() -> MultiPathFusionNet:
     """
     global _model, _model_loaded
     if _model is None:
-        _model = MultiPathFusionNet(in_channels=4, num_classes=4).to(DEVICE)
+        _model = MultiPathFusionNet(in_channels=1, num_classes=2).to(DEVICE)
 
         if not WEIGHTS_PATH.exists():
             raise RuntimeError(
@@ -83,9 +81,9 @@ def is_model_loaded() -> bool:
 
 def preprocess_image(image_bytes: bytes) -> tuple[torch.Tensor, np.ndarray]:
     """
-    Load image bytes → grayscale → normalise → replicate to 4 channels.
+    Load image bytes → grayscale → normalise → 1-channel tensor.
     Returns:
-        tensor: (1, 4, 256, 256) float32 tensor for model input
+        tensor: (1, 1, 256, 256) float32 tensor for model input
         arr_uint8: (256, 256) uint8 array for visualization
     """
     img = Image.open(io.BytesIO(image_bytes)).convert("L")
@@ -99,11 +97,9 @@ def preprocess_image(image_bytes: bytes) -> tuple[torch.Tensor, np.ndarray]:
     else:
         arr_norm = np.zeros_like(arr)
 
-    # Replicate single channel to 4 channels (T1, T1ce, T2, FLAIR)
-    # This allows inference on single-modality uploads;
-    # for real multi-modal data, use preprocess_nifti instead.
-    arr_4ch = np.stack([arr_norm] * 4, axis=0)  # (4, 256, 256)
-    tensor = torch.from_numpy(arr_4ch).unsqueeze(0).to(DEVICE)  # (1, 4, 256, 256)
+    # Single channel input: (1, 256, 256)
+    arr_1ch = arr_norm[np.newaxis, :, :]  # (1, 256, 256)
+    tensor = torch.from_numpy(arr_1ch).unsqueeze(0).to(DEVICE)  # (1, 1, 256, 256)
 
     arr_uint8 = (arr_norm * 255).astype(np.uint8)
     return tensor, arr_uint8
@@ -126,7 +122,7 @@ def run_inference(image_bytes: bytes) -> dict:
     model = get_model()
 
     with torch.no_grad():
-        logits = model(tensor)                # (1, 4, 256, 256)
+        logits = model(tensor)                # (1, 2, 256, 256)
         probs  = F.softmax(logits, dim=1)
         pred   = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)  # (256, 256)
 
@@ -135,19 +131,16 @@ def run_inference(image_bytes: bytes) -> dict:
     confidence = round(max_prob * 100, 1)
 
     # ── Metrics ─────────────────────────────────────────────
-    vol_whole     = float(np.sum(pred >= 1))
-    vol_core      = float(np.sum(pred >= 2))
-    vol_enhancing = float(np.sum(pred == 3))
-    tumor_volume_mm3 = max(round(vol_whole * 0.15, 0), 1)
+    vol_tumor = float(np.sum(pred == 1))
+    tumor_volume_mm3 = max(round(vol_tumor * 0.15, 0), 1)
 
     # ── Coordinates (centroid of tumor region) ────────────
-    for class_threshold in [(pred == 3), (pred >= 2), (pred >= 1)]:
-        if class_threshold.any():
-            ys, xs = np.where(class_threshold)
-            cx = round(float(xs.mean()) / IMG_SIZE * 100, 1)
-            cy = round(float(ys.mean()) / IMG_SIZE * 100, 1)
-            cz = 50.0  # Z-coordinate requires volumetric data
-            break
+    tumor_region = pred == 1
+    if tumor_region.any():
+        ys, xs = np.where(tumor_region)
+        cx = round(float(xs.mean()) / IMG_SIZE * 100, 1)
+        cy = round(float(ys.mean()) / IMG_SIZE * 100, 1)
+        cz = 50.0  # Z-coordinate requires volumetric data
     else:
         cx, cy, cz = 50.0, 50.0, 50.0
 
@@ -166,9 +159,7 @@ def run_inference(image_bytes: bytes) -> dict:
         "overlay_image": overlay_b64,
         "axial_projection": axial_b64,
         "mask_summary": {
-            "whole_tumor_pixels":     int(vol_whole),
-            "tumor_core_pixels":      int(vol_core),
-            "enhancing_tumor_pixels": int(vol_enhancing),
+            "tumor_pixels": int(vol_tumor),
         },
         "treatment_recommendation": _get_treatment_recommendation(tumor_volume_mm3, confidence, cx, cy, cz),
     }
@@ -184,9 +175,8 @@ def _array_to_base64_png(arr: np.ndarray, mode='L') -> str:
 
 def _make_overlay_image(arr_uint8: np.ndarray, mask: np.ndarray) -> str:
     """
-    Compose MRI with heatmap-style colour overlay on the left
-    and clean MRI on the right. Uses intensity-weighted alpha for
-    a proper gradient heatmap effect.
+    Compose MRI with colour overlay for tumor region on the left
+    and clean MRI on the right.
     Returns base64 PNG.
     """
     from scipy import ndimage
@@ -196,34 +186,23 @@ def _make_overlay_image(arr_uint8: np.ndarray, mask: np.ndarray) -> str:
     # Base image – RGB from grayscale
     base = Image.fromarray(arr_uint8, 'L').convert('RGBA')
 
-    # Build a smooth heatmap overlay based on mask + distance transform
+    # Build overlay for tumor region
     overlay_arr = np.zeros((h, w, 4), dtype=np.uint8)
 
-    # For each tumor class, create gradient alpha based on distance from edge
-    for cls_idx in [1, 2, 3]:
-        region = mask >= cls_idx if cls_idx < 3 else mask == cls_idx
-        if not region.any():
-            continue
-
-        # Distance from the region boundary (creates gradient effect)
+    region = mask == 1
+    if region.any():
         dist = ndimage.distance_transform_edt(region).astype(np.float32)
         max_dist = max(dist.max(), 1.0)
-        # Normalise distance to [0, 1]
         dist_norm = dist / max_dist
 
-        color = CLASS_COLORS[cls_idx]
-        pixels = region & (mask == cls_idx)  # Only the exact class pixels
-        if not pixels.any():
-            continue
-
-        # Alpha varies with distance from edge: stronger in center
+        color = CLASS_COLORS[1]
         alpha_base = color[3]
         alpha_map = (dist_norm * alpha_base * 0.8 + alpha_base * 0.2).clip(0, 255)
 
-        overlay_arr[pixels, 0] = color[0]
-        overlay_arr[pixels, 1] = color[1]
-        overlay_arr[pixels, 2] = color[2]
-        overlay_arr[pixels, 3] = alpha_map[pixels].astype(np.uint8)
+        overlay_arr[region, 0] = color[0]
+        overlay_arr[region, 1] = color[1]
+        overlay_arr[region, 2] = color[2]
+        overlay_arr[region, 3] = alpha_map[region].astype(np.uint8)
 
     overlay = Image.fromarray(overlay_arr, 'RGBA')
 
@@ -248,17 +227,9 @@ def _make_overlay_image(arr_uint8: np.ndarray, mask: np.ndarray) -> str:
 
     # Add legend at bottom of overlay side
     legend_y = h - 22
-    legend_items = [
-        (1, "Whole Tumor"),
-        (2, "Tumor Core"),
-        (3, "Enhancing"),
-    ]
-    lx = 8
-    for cls_idx, label in legend_items:
-        c = CLASS_COLORS[cls_idx]
-        draw.rectangle([lx, legend_y, lx + 10, legend_y + 10], fill=(c[0], c[1], c[2], 255))
-        draw.text((lx + 14, legend_y - 1), label, fill=(255, 255, 255, 220))
-        lx += len(label) * 7 + 24
+    c = CLASS_COLORS[1]
+    draw.rectangle([8, legend_y, 18, legend_y + 10], fill=(c[0], c[1], c[2], 255))
+    draw.text((22, legend_y - 1), "Tumor", fill=(255, 255, 255, 220))
 
     buf = io.BytesIO()
     split.convert('RGB').save(buf, format='PNG')
@@ -275,7 +246,7 @@ def _make_3d_projection(mask: np.ndarray, view: str = 'axial') -> str:
         if cls_idx == 0:
             continue
         region = mask == cls_idx
-        draw_arr[region] = color[:3]  # Drop alpha for RGB
+        draw_arr[region] = color[:3]
 
     buf = io.BytesIO()
     Image.fromarray(draw_arr).save(buf, format='PNG')

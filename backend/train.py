@@ -1,32 +1,30 @@
 """
-Training script for Multi-Path Fusion Network on BraTS dataset.
+Training script for Multi-Path Fusion Network on LGG MRI Segmentation dataset.
 
-Automatically downloads the BraTS 2020 dataset from Kaggle via kagglehub.
+Automatically downloads the dataset from Kaggle via kagglehub (no credentials required).
 No manual dataset setup required.
 
 Usage:
-  python train.py                         # auto-downloads BraTS, trains, saves weights
+  python train.py                         # auto-downloads dataset, trains, saves weights
   python train.py --epochs 100            # custom epochs
-  python train.py --data_dir /my/brats    # use local dataset instead of downloading
+  python train.py --data_dir /my/data     # use local dataset instead of downloading
 """
 
 import argparse
-import os
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from model import MultiPathFusionNet, CombinedLoss, compute_all_dice
-from dataset import BraTSDataset, find_brats_training_dir
+from model import MultiPathFusionNet, CombinedLoss, compute_dice
+from dataset import LGGDataset, find_lgg_data_dir
 
 # ─────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────
-KAGGLE_DATASET = "awsaf49/brats20-dataset-training-validation"
-DEFAULT_DATA_DIR = Path(__file__).parent / "data" / "BraTS2020"
+KAGGLE_DATASET = "mateuszbuda/lgg-mri-segmentation"
+DEFAULT_DATA_DIR = Path(__file__).parent / "data" / "lgg_dataset"
 SAVE_DIR = Path(__file__).parent / "models"
 IMG_SIZE = 256
 VAL_SPLIT = 0.2  # 20% of patients for validation
@@ -36,27 +34,15 @@ VAL_SPLIT = 0.2  # 20% of patients for validation
 # Dataset download
 # ─────────────────────────────────────────────────────────────
 
-def _has_patient_dirs(path: Path) -> bool:
-    """Check if a directory contains BraTS patient subdirectories."""
-    if not path.is_dir():
-        return False
-    for child in path.iterdir():
-        if child.is_dir() and (
-            list(child.glob("*_t1.nii*")) or list(child.glob("*_t1.nii.gz"))
-        ):
-            return True
-    return False
-
-
-def download_brats_dataset() -> Path:
+def download_lgg_dataset() -> Path:
     """
-    Download BraTS 2020 dataset via kagglehub if not already present.
+    Download LGG MRI Segmentation dataset via kagglehub if not already present.
     Returns the path to the directory containing patient folders.
     """
-    # Check if data already exists in backend/data/BraTS2020
+    # Check if data already exists
     if DEFAULT_DATA_DIR.exists():
         try:
-            root = find_brats_training_dir(str(DEFAULT_DATA_DIR))
+            root = find_lgg_data_dir(str(DEFAULT_DATA_DIR))
             print(f"✓ Dataset already exists at {root}")
             return root
         except FileNotFoundError:
@@ -64,28 +50,26 @@ def download_brats_dataset() -> Path:
 
     import kagglehub
 
-    print(f"📦 Downloading BraTS 2020 dataset from Kaggle ({KAGGLE_DATASET})...")
-    print("   This may take several minutes on first run.")
-    print("   Note: Requires Kaggle API credentials (~/.kaggle/kaggle.json).")
-    print("   Set up at: https://www.kaggle.com/settings → API → Create New Token")
+    print(f"📦 Downloading LGG MRI Segmentation dataset ({KAGGLE_DATASET})...")
+    print("   This may take a few minutes on first run.")
     downloaded_path = Path(kagglehub.dataset_download(KAGGLE_DATASET))
     print(f"✓ Downloaded to {downloaded_path}")
 
-    # Find the training data root within the download
-    training_root = find_brats_training_dir(str(downloaded_path))
-    print(f"✓ Found training data at {training_root}")
+    # Find the data root within the download
+    data_root = find_lgg_data_dir(str(downloaded_path))
+    print(f"✓ Found training data at {data_root}")
 
-    # Create a symlink at backend/data/BraTS2020 for convenience
+    # Create a symlink for convenience
     DEFAULT_DATA_DIR.parent.mkdir(parents=True, exist_ok=True)
     if not DEFAULT_DATA_DIR.exists():
         try:
-            DEFAULT_DATA_DIR.symlink_to(training_root)
-            print(f"✓ Linked {DEFAULT_DATA_DIR} → {training_root}")
+            DEFAULT_DATA_DIR.symlink_to(data_root)
+            print(f"✓ Linked {DEFAULT_DATA_DIR} → {data_root}")
         except OSError as e:
             print(f"⚠ Could not create symlink at {DEFAULT_DATA_DIR}: {e}")
-            print(f"  Using downloaded path directly: {training_root}")
+            print(f"  Using downloaded path directly: {data_root}")
 
-    return training_root
+    return data_root
 
 
 # ─────────────────────────────────────────────────────────────
@@ -98,10 +82,10 @@ def train(args):
 
     # ── Resolve dataset path ─────────────────────────────────
     if args.data_dir:
-        data_root = find_brats_training_dir(args.data_dir)
+        data_root = find_lgg_data_dir(args.data_dir)
         print(f"Using local dataset: {data_root}")
     else:
-        data_root = download_brats_dataset()
+        data_root = download_lgg_dataset()
 
     # ── Discover patients and split into train/val ───────────
     patient_dirs = sorted([
@@ -117,24 +101,23 @@ def train(args):
     print(f"Patients: {n_patients} total → {n_train} train / {n_val} val")
 
     # ── Create datasets ──────────────────────────────────────
-    train_ds = BraTSDataset(
+    train_ds = LGGDataset(
         data_dir=str(data_root),
         img_size=IMG_SIZE,
         patient_indices=train_indices,
     )
-    val_ds = BraTSDataset(
+    val_ds = LGGDataset(
         data_dir=str(data_root),
         img_size=IMG_SIZE,
         patient_indices=val_indices,
-        slices_per_volume=5,
     )
     print(f"Samples: {len(train_ds)} train / {len(val_ds)} val")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    # ── Model — 4 input channels for T1, T1ce, T2, FLAIR ────
-    model = MultiPathFusionNet(in_channels=4, num_classes=4).to(device)
+    # ── Model — 1 input channel (grayscale), 2 classes (background + tumor) ──
+    model = MultiPathFusionNet(in_channels=1, num_classes=2).to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {params:,}")
 
@@ -167,7 +150,7 @@ def train(args):
 
         # ── Validate ─────────────────────────────────────────
         model.eval()
-        val_dice = {"whole_tumor": 0.0, "tumor_core": 0.0, "enhancing_tumor": 0.0}
+        total_tumor_dice = 0.0
         n_val_samples = 0
 
         with torch.no_grad():
@@ -176,40 +159,32 @@ def train(args):
                 pred_logits = model(imgs)
                 pred_masks = pred_logits.argmax(dim=1).cpu()
                 for i in range(imgs.size(0)):
-                    d = compute_all_dice(pred_masks[i], masks[i])
-                    for k in val_dice:
-                        val_dice[k] += d[k]
+                    d = compute_dice(pred_masks[i], masks[i], class_idx=1)
+                    total_tumor_dice += d
                     n_val_samples += 1
 
-        for k in val_dice:
-            val_dice[k] /= max(n_val_samples, 1)
-
-        avg_val_dice = sum(val_dice.values()) / 3
+        avg_tumor_dice = total_tumor_dice / max(n_val_samples, 1)
         elapsed = time.time() - t0
 
         print(
             f"Epoch [{epoch:3d}/{args.epochs}] | Loss: {avg_loss:.4f} | "
-            f"WT: {val_dice['whole_tumor']:.1f}% | "
-            f"TC: {val_dice['tumor_core']:.1f}% | "
-            f"ET: {val_dice['enhancing_tumor']:.1f}% | "
-            f"Avg: {avg_val_dice:.1f}% | {elapsed:.1f}s"
+            f"Tumor Dice: {avg_tumor_dice:.1f}% | {elapsed:.1f}s"
         )
 
         # ── Save best model ──────────────────────────────────
-        if avg_val_dice > best_dice:
-            best_dice = avg_val_dice
+        if avg_tumor_dice > best_dice:
+            best_dice = avg_tumor_dice
             path = SAVE_DIR / "best_model.pth"
             torch.save({
                 "epoch": epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "dice_scores": val_dice,
+                "tumor_dice": avg_tumor_dice,
             }, str(path))
-            print(f"  ✓ Best model saved (avg Dice: {best_dice:.1f}%) → {path}")
+            print(f"  ✓ Best model saved (Tumor Dice: {best_dice:.1f}%) → {path}")
 
-    print(f"\nTraining complete. Best Avg Dice: {best_dice:.1f}%")
+    print(f"\nTraining complete. Best Tumor Dice: {best_dice:.1f}%")
     print(f"Model weights saved to: {SAVE_DIR / 'best_model.pth'}")
-    print("Reference target (Wu et al. 2023): WT≥90%, TC≥90%, ET≥85%")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -219,7 +194,7 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MPFNet for Brain Tumor Segmentation")
     parser.add_argument("--data_dir", type=str, default=None,
-                        help="Path to local BraTS data (skips Kaggle download)")
+                        help="Path to local LGG dataset (skips Kaggle download)")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)

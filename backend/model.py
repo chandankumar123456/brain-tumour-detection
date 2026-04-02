@@ -178,13 +178,8 @@ class DecoderBlock(nn.Module):
 class MultiPathFusionNet(nn.Module):
     """
     Multi-Path Fusion Network with Global Attention for Brain Tumor Segmentation.
-    Input : (B, in_channels, 256, 256)  – 4-channel BraTS MRI (T1, T1ce, T2, FLAIR)
+    Input : (B, in_channels, 256, 256)  – MRI image
     Output: (B, num_classes, 256, 256)  – Per-pixel class logits
-    Classes:
-        0 – Background
-        1 – Whole Tumor  (green)
-        2 – Tumor Core   (orange)
-        3 – Enhancing Tumor (yellow)
     """
 
     def __init__(self, in_channels=4, num_classes=4, base=32):
@@ -272,7 +267,8 @@ class DiceLoss(nn.Module):
         super().__init__()
         self.smooth = smooth
 
-    def forward(self, pred, target, num_classes=4):
+    def forward(self, pred, target):
+        num_classes = pred.shape[1]
         pred = F.softmax(pred, dim=1)
         loss = 0.0
         for c in range(num_classes):
@@ -306,20 +302,16 @@ def dice_score(pred_mask: torch.Tensor, true_mask: torch.Tensor, class_idx: int,
     return (2 * intersection + smooth) / (p.sum().item() + t.sum().item() + smooth)
 
 
-def compute_all_dice(pred_mask: torch.Tensor, true_mask: torch.Tensor) -> dict:
-    """Compute Whole Tumor / Tumor Core / Enhancing Tumor Dice scores."""
-    return {
-        "whole_tumor":      round(dice_score(pred_mask, true_mask, 1) * 100, 1),
-        "tumor_core":       round(dice_score(pred_mask, true_mask, 2) * 100, 1),
-        "enhancing_tumor":  round(dice_score(pred_mask, true_mask, 3) * 100, 1),
-    }
+def compute_dice(pred_mask: torch.Tensor, true_mask: torch.Tensor, class_idx: int = 1) -> float:
+    """Compute Dice score (as percentage) for a given class."""
+    return round(dice_score(pred_mask, true_mask, class_idx) * 100, 1)
 
 
 if __name__ == "__main__":
     # Quick sanity check
-    model = MultiPathFusionNet(in_channels=4, num_classes=4)
-    dummy = torch.randn(2, 4, 256, 256)
+    model = MultiPathFusionNet(in_channels=1, num_classes=2)
+    dummy = torch.randn(2, 1, 256, 256)
     out = model(dummy)
-    print(f"Output shape: {out.shape}")   # Expected: (2, 4, 256, 256)
+    print(f"Output shape: {out.shape}")   # Expected: (2, 2, 256, 256)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")

@@ -170,8 +170,12 @@ class BraTSDataset(Dataset):
 
         # Filter to requested patient indices
         if patient_indices is not None:
-            patient_dirs = [all_patient_dirs[i] for i in patient_indices
-                           if i < len(all_patient_dirs)]
+            if any(i >= len(all_patient_dirs) for i in patient_indices):
+                raise IndexError(
+                    f"patient_indices contains values >= {len(all_patient_dirs)} "
+                    f"(number of patient directories in {data_dir})"
+                )
+            patient_dirs = [all_patient_dirs[i] for i in patient_indices]
         else:
             patient_dirs = all_patient_dirs
 

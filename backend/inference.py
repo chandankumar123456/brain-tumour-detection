@@ -59,7 +59,7 @@ def get_model() -> MultiPathFusionNet:
                 f"Run train.py first to generate weights."
             )
 
-        checkpoint = torch.load(str(WEIGHTS_PATH), map_location=DEVICE, weights_only=False)
+        checkpoint = torch.load(str(WEIGHTS_PATH), map_location=DEVICE, weights_only=True)
         if isinstance(checkpoint, dict) and "model_state" in checkpoint:
             _model.load_state_dict(checkpoint["model_state"])
         else:

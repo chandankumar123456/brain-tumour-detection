@@ -66,6 +66,8 @@ def download_brats_dataset() -> Path:
 
     print(f"📦 Downloading BraTS 2020 dataset from Kaggle ({KAGGLE_DATASET})...")
     print("   This may take several minutes on first run.")
+    print("   Note: Requires Kaggle API credentials (~/.kaggle/kaggle.json).")
+    print("   Set up at: https://www.kaggle.com/settings → API → Create New Token")
     downloaded_path = Path(kagglehub.dataset_download(KAGGLE_DATASET))
     print(f"✓ Downloaded to {downloaded_path}")
 
@@ -79,9 +81,9 @@ def download_brats_dataset() -> Path:
         try:
             DEFAULT_DATA_DIR.symlink_to(training_root)
             print(f"✓ Linked {DEFAULT_DATA_DIR} → {training_root}")
-        except OSError:
-            # Symlink may fail on some systems; that's fine, we use the path directly
-            pass
+        except OSError as e:
+            print(f"⚠ Could not create symlink at {DEFAULT_DATA_DIR}: {e}")
+            print(f"  Using downloaded path directly: {training_root}")
 
     return training_root
 

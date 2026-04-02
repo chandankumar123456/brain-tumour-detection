@@ -1,11 +1,10 @@
 """
 Training script for Multi-Path Fusion Network on BraTS dataset.
-Supports BraTS 2015 / 2019 / 2020 folder structures.
 
-Usage:
+Usage with real BraTS data:
   python train.py --data_dir /path/to/BraTS --epochs 50 --batch_size 4
 
-For quick local test with synthetic data:
+For pipeline testing with 4-channel synthetic data:
   python train.py --synthetic --epochs 5
 """
 
@@ -25,72 +24,70 @@ from model import MultiPathFusionNet, CombinedLoss, compute_all_dice, dice_score
 
 
 # ─────────────────────────────────────────────────────────────
-# Synthetic BraTS-like Dataset (for smoke-test / demo)
+# 4-Channel Synthetic Dataset (for pipeline testing only)
 # ─────────────────────────────────────────────────────────────
 
-class SyntheticBraTSDataset(Dataset):
+class SyntheticBraTS4ChDataset(Dataset):
     """
-    Generates synthetic brain MRI slices with segmentation masks
-    that mimic BraTS 2019 label conventions:
-      0 = Background
-      1 = Whole Tumor (NCR + ET + ED)
-      2 = Tumor Core  (NCR + ET)
-      3 = Enhancing Tumor (ET)
+    Generates 4-channel synthetic brain MRI slices with segmentation masks
+    for pipeline testing. Produces tensors matching the real BraTS format:
+      image: (4, 256, 256) — simulating T1, T1ce, T2, FLAIR
+      mask:  (256, 256) — classes {0, 1, 2, 3}
     """
 
-    def __init__(self, n_samples=200, img_size=256):
+    def __init__(self, n_samples: int = 200, img_size: int = 256):
         self.n = n_samples
         self.sz = img_size
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.n
 
-    def __getitem__(self, idx):
-        random.seed(idx)
-        np.random.seed(idx)
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        rng = np.random.RandomState(idx)
         h = w = self.sz
 
-        img = np.zeros((h, w), dtype=np.float32)
         mask = np.zeros((h, w), dtype=np.int64)
-
         Y, X = np.ogrid[:h, :w]
-        cy, cx = h // 2 + random.randint(-10, 10), w // 2 + random.randint(-10, 10)
+        cy = h // 2 + rng.randint(-10, 11)
+        cx = w // 2 + rng.randint(-10, 11)
 
         # Brain region
         brain = ((X - cx) ** 2 / 85**2 + (Y - cy) ** 2 / 100**2) <= 1.0
-        img[brain] = np.random.uniform(0.3, 0.5, int(brain.sum()))
 
-        # White matter
-        wm = ((X - cx) ** 2 / 70**2 + (Y - cy) ** 2 / 85**2) <= 1.0
-        img[wm] = np.random.uniform(0.5, 0.7, int(wm.sum()))
+        # Tumor parameters
+        tx = cx + rng.randint(-25, 26)
+        ty = cy + rng.randint(-25, 26)
+        s = rng.uniform(0.6, 1.4)
 
-        # Tumor
-        tx = cx + random.randint(-25, 25)
-        ty = cy + random.randint(-25, 25)
-        s = random.uniform(0.6, 1.4)
+        wt = (((X - tx) ** 2 / (45*s)**2 + (Y - ty)**2 / (50*s)**2) <= 1.0) & brain
+        tc = (((X - tx)**2 / (25*s)**2 + (Y - ty)**2 / (28*s)**2) <= 1.0) & wt
+        etx, ety = tx + rng.randint(-5, 6), ty + rng.randint(-5, 6)
+        et = (((X - etx)**2 / (12*s)**2 + (Y - ety)**2 / (13*s)**2) <= 1.0) & tc
 
-        # Whole Tumor
-        wt = ((X - tx) **2 / (45*s)**2 + (Y - ty)**2 / (50*s)**2) <= 1.0 & brain
-        img[wt] = np.random.uniform(0.65, 0.8, int(wt.sum()))
         mask[wt] = 1
-
-        # Tumor Core
-        tc = ((X - tx)**2 / (25*s)**2 + (Y - ty)**2 / (28*s)**2) <= 1.0 & wt
-        img[tc] = np.random.uniform(0.78, 0.9, int(tc.sum()))
         mask[tc] = 2
-
-        # Enhancing Tumor
-        etx, ety = tx + random.randint(-5, 5), ty + random.randint(-5, 5)
-        et = ((X - etx)**2 / (12*s)**2 + (Y - ety)**2 / (13*s)**2) <= 1.0 & tc
-        img[et] = np.random.uniform(0.88, 1.0, int(et.sum()))
         mask[et] = 3
 
-        # Noise
-        img += np.random.normal(0, 0.02, (h, w)).astype(np.float32)
-        img = np.clip(img, 0, 1)
+        # Generate 4 modality channels with slightly different intensity profiles
+        channels = []
+        for mod_idx in range(4):
+            img = np.zeros((h, w), dtype=np.float32)
+            base_offset = mod_idx * 0.05
+            img[brain] = rng.uniform(0.3 + base_offset, 0.5 + base_offset, int(brain.sum()))
 
-        img_t  = torch.from_numpy(img).unsqueeze(0)   # (1, H, W)
-        mask_t = torch.from_numpy(mask)                # (H, W)
+            wm = ((X - cx) ** 2 / 70**2 + (Y - cy) ** 2 / 85**2) <= 1.0
+            img[wm] = rng.uniform(0.5 + base_offset, 0.7 + base_offset, int(wm.sum()))
+
+            img[wt] = rng.uniform(0.65 + base_offset, 0.8 + base_offset, int(wt.sum()))
+            img[tc] = rng.uniform(0.78 + base_offset, 0.9 + base_offset, int(tc.sum()))
+            img[et] = rng.uniform(0.88, 1.0, int(et.sum()))
+
+            img += rng.normal(0, 0.02, (h, w)).astype(np.float32)
+            img = np.clip(img, 0, 1)
+            channels.append(img)
+
+        img_t = torch.from_numpy(np.stack(channels, axis=0))  # (4, H, W)
+        mask_t = torch.from_numpy(mask)                         # (H, W)
         return img_t, mask_t
 
 
@@ -104,17 +101,26 @@ def train(args):
 
     # Dataset
     if args.synthetic:
-        train_ds = SyntheticBraTSDataset(n_samples=400, img_size=256)
-        val_ds   = SyntheticBraTSDataset(n_samples=80,  img_size=256)
-        print(f"Using synthetic BraTS-like dataset: {len(train_ds)} train / {len(val_ds)} val")
+        train_ds = SyntheticBraTS4ChDataset(n_samples=400, img_size=256)
+        val_ds   = SyntheticBraTS4ChDataset(n_samples=80,  img_size=256)
+        print(f"Using 4-channel synthetic dataset for pipeline testing: "
+              f"{len(train_ds)} train / {len(val_ds)} val")
     else:
-        raise NotImplementedError("Real BraTS loader not included. Use --synthetic for demo.")
+        from dataset import BraTSDataset
+        if not args.data_dir:
+            raise ValueError(
+                "BraTS data directory required. Use --data_dir /path/to/BraTS "
+                "or --synthetic for pipeline testing."
+            )
+        train_ds = BraTSDataset(data_dir=args.data_dir, img_size=256)
+        val_ds   = BraTSDataset(data_dir=args.data_dir, img_size=256, slices_per_volume=5)
+        print(f"Using BraTS dataset: {len(train_ds)} train / {len(val_ds)} val")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    # Model
-    model = MultiPathFusionNet(in_channels=1, num_classes=4).to(device)
+    # Model — 4 input channels for T1, T1ce, T2, FLAIR
+    model = MultiPathFusionNet(in_channels=4, num_classes=4).to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {params:,}")
 
@@ -124,7 +130,7 @@ def train(args):
     criterion = CombinedLoss(alpha=0.5)
 
     best_dice = 0.0
-    save_dir = Path("checkpoints")
+    save_dir = Path(__file__).parent / "models"
     save_dir.mkdir(exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):
@@ -163,7 +169,7 @@ def train(args):
                     n_val += 1
 
         for k in val_dice:
-            val_dice[k] /= n_val
+            val_dice[k] /= max(n_val, 1)
 
         avg_val_dice = sum(val_dice.values()) / 3
         elapsed = time.time() - t0
@@ -198,15 +204,19 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MPFNet for Brain Tumor Segmentation")
-    parser.add_argument("--data_dir",   type=str, default=None)
-    parser.add_argument("--synthetic",  action="store_true", default=False)
+    parser.add_argument("--data_dir",   type=str, default=None,
+                        help="Path to BraTS training data directory")
+    parser.add_argument("--synthetic",  action="store_true", default=False,
+                        help="Use 4-channel synthetic data for pipeline testing")
     parser.add_argument("--epochs",     type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr",         type=float, default=1e-3)
     args = parser.parse_args()
 
     if not args.synthetic and not args.data_dir:
-        print("No data directory specified. Falling back to synthetic dataset.")
-        args.synthetic = True
+        print("ERROR: No data directory specified. Use --data_dir or --synthetic.")
+        print("  For real training: python train.py --data_dir /path/to/BraTS")
+        print("  For pipeline test: python train.py --synthetic --epochs 5")
+        exit(1)
 
     train(args)

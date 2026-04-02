@@ -1,6 +1,6 @@
 """
 FastAPI Backend – Brain Tumor Segmentation Dashboard
-Endpoints: upload MRI, get demo data, generate report, export JSON.
+Endpoints: upload MRI for real inference, health check, generate report.
 """
 
 import io
@@ -14,10 +14,10 @@ from pydantic import BaseModel
 from pathlib import Path
 
 try:
-    from inference import run_inference, generate_demo_mri
+    from inference import run_inference, is_model_loaded
     from report_generator import generate_pdf_report
 except ImportError:
-    from backend.inference import run_inference, generate_demo_mri
+    from backend.inference import run_inference, is_model_loaded
     from backend.report_generator import generate_pdf_report
 
 # ─────────────────────────────────────────────────────────────
@@ -57,39 +57,35 @@ async def root():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "model": "MultiPathFusionNet", "version": "1.0.0"}
+    """Health check endpoint with real model status."""
+    weights_path = Path(__file__).parent / "models" / "best_model.pth"
+    return {
+        "status": "ok",
+        "model": "MultiPathFusionNet",
+        "version": "1.0.0",
+        "weights_loaded": is_model_loaded(),
+        "weights_available": weights_path.exists(),
+    }
 
 
 @app.post("/api/upload")
 async def upload_mri(file: UploadFile = File(...)):
     """
-    Upload an MRI image (JPG/PNG/DICOM/NIfTI) for brain tumor segmentation.
-    Returns segmentation mask, Dice scores, volume, coordinates, and visualisations.
+    Upload an MRI image (JPG/PNG) for brain tumor segmentation.
+    Returns segmentation mask, volume, coordinates, and visualisations.
+    All outputs come strictly from the trained neural network.
     """
-    allowed_types = {"image/jpeg", "image/png", "image/tiff", "application/octet-stream", ""}
-    content_type = file.content_type or ""
-
-    # Accept any image-like file
     image_bytes = await file.read()
     if len(image_bytes) == 0:
         raise HTTPException(status_code=400, detail="Empty file uploaded.")
 
     try:
         result = run_inference(image_bytes)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(exc)}")
 
-    return JSONResponse(result)
-
-
-@app.get("/api/demo")
-async def get_demo():
-    """
-    Generate and analyse a synthetic BraTS-style demo MRI.
-    Returns the same structure as /api/upload.
-    """
-    demo_bytes = generate_demo_mri()
-    result = run_inference(demo_bytes)
     return JSONResponse(result)
 
 
@@ -116,34 +112,3 @@ async def export_json_report(result: dict):
         media_type="application/json",
         headers={"Content-Disposition": "attachment; filename=brain_tumor_report.json"},
     )
-
-
-@app.get("/api/demo/mri")
-async def get_demo_mri_png():
-    """Return a raw synthetic MRI PNG for preview."""
-    mri_bytes = generate_demo_mri()
-    return Response(content=mri_bytes, media_type="image/png")
-
-
-@app.post("/api/reanalyze")
-async def reanalyze(result: dict):
-    """
-    Re-run analysis on a previously uploaded image (pass back the mri_image field).
-    Applies slight parameter perturbation to simulate re-analysis.
-    """
-    mri_b64 = result.get("mri_image")
-    if not mri_b64:
-        # Run on fresh demo image
-        demo_bytes = generate_demo_mri()
-        new_result = run_inference(demo_bytes)
-    else:
-        mri_bytes = base64.b64decode(mri_b64)
-        new_result = run_inference(mri_bytes)
-
-    # Slightly perturb scores for reanalysis effect
-    import random
-    for k in new_result.get("dice_scores", {}):
-        new_result["dice_scores"][k] = round(
-            new_result["dice_scores"][k] + random.uniform(-0.5, 0.5), 1
-        )
-    return JSONResponse(new_result)

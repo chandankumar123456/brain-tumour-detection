@@ -84,7 +84,7 @@ def generate_pdf_report(analysis_result: dict) -> bytes:
         ["Attending Physician:", "Dr. Sarah Andrews", "Date:", now.strftime("%B %d, %Y")],
         ["Department:", "Neuro-Oncology",  "Time:", now.strftime("%H:%M:%S")],
         ["Report ID:", f"BTR-{now.strftime('%Y%m%d%H%M%S')}", "Modality:", "MRI Brain"],
-        ["Patient Study:", "BraTS-Demo",   "Software:", "MPFNet v1.0 (Wu et al. 2023)"],
+        ["Patient Study:", "BraTS-2020",   "Software:", "MPFNet v1.0 (Wu et al. 2023)"],
     ]
     info_table = Table(info_data, colWidths=[45*mm, 60*mm, 30*mm, 45*mm])
     info_table.setStyle(TableStyle([

@@ -80,6 +80,37 @@ def _find_modality_file(patient_dir: Path, modality: str) -> Path:
     )
 
 
+def find_brats_training_dir(base_path: str | Path) -> Path:
+    """
+    Walk directory tree to find the directory containing BraTS patient folders.
+    Handles various BraTS directory structures (2019/2020/2021).
+
+    Returns the path containing patient subdirectories (e.g. BraTS20_Training_001/).
+    """
+    base = Path(base_path)
+    candidates = [
+        base / "BraTS2020_TrainingData" / "MICCAI_BraTS2020_TrainingData",
+        base / "MICCAI_BraTS2020_TrainingData",
+        base / "BraTS2020_TrainingData",
+        base / "BraTS2021_TrainingData",
+        base / "MICCAI_BraTS2021_TrainingData",
+        base,
+    ]
+    for candidate in candidates:
+        if not candidate.is_dir():
+            continue
+        for child in candidate.iterdir():
+            if child.is_dir() and (
+                list(child.glob("*_t1.nii*")) or list(child.glob("*_t1.nii.gz"))
+            ):
+                return candidate
+
+    raise FileNotFoundError(
+        f"Cannot find BraTS training data (patient directories) in {base_path}. "
+        f"Expected structure: .../BraTS20_Training_001/*_t1.nii.gz"
+    )
+
+
 class BraTSDataset(Dataset):
     """
     Dataset loader for BraTS challenge data.
@@ -102,9 +133,17 @@ class BraTSDataset(Dataset):
         img_size: Target image size (default 256).
         slices_per_volume: Number of axial slices to sample per volume.
             If None, uses all slices containing tumor.
+        patient_indices: Optional list of patient directory indices to use
+            (for train/val splitting). If None, uses all patients.
     """
 
-    def __init__(self, data_dir: str, img_size: int = IMG_SIZE, slices_per_volume: int | None = None):
+    def __init__(
+        self,
+        data_dir: str,
+        img_size: int = IMG_SIZE,
+        slices_per_volume: int | None = None,
+        patient_indices: list[int] | None = None,
+    ):
         if nib is None:
             raise ImportError(
                 "nibabel is required for BraTS data loading. "
@@ -117,17 +156,24 @@ class BraTSDataset(Dataset):
         if not self.data_dir.exists():
             raise FileNotFoundError(f"BraTS data directory not found: {data_dir}")
 
-        # Discover patient directories
-        patient_dirs = sorted([
+        # Discover patient directories (only those with seg files for training)
+        all_patient_dirs = sorted([
             d for d in self.data_dir.iterdir()
             if d.is_dir() and not d.name.startswith(".")
         ])
 
-        if not patient_dirs:
+        if not all_patient_dirs:
             raise FileNotFoundError(
                 f"No patient directories found in {data_dir}. "
                 f"Expected structure: data_dir/PatientXXX/*_t1.nii.gz"
             )
+
+        # Filter to requested patient indices
+        if patient_indices is not None:
+            patient_dirs = [all_patient_dirs[i] for i in patient_indices
+                           if i < len(all_patient_dirs)]
+        else:
+            patient_dirs = all_patient_dirs
 
         # Build index of (patient_dir, slice_idx) pairs
         self.samples: list[tuple[Path, int]] = []
@@ -204,7 +250,7 @@ class BraTSDataset(Dataset):
         # Map BraTS labels to model classes
         mask = _map_brats_labels(seg_slice)
 
-        # Resize to target size using nearest-neighbor for mask, bilinear for image
+        # Resize to target size using bilinear for image, nearest for mask
         image_tensor = torch.from_numpy(image).unsqueeze(0)  # (1, 4, H, W)
         image_tensor = torch.nn.functional.interpolate(
             image_tensor, size=(self.img_size, self.img_size),

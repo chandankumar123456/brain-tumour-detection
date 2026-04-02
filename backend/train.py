@@ -1,94 +1,89 @@
 """
 Training script for Multi-Path Fusion Network on BraTS dataset.
 
-Usage with real BraTS data:
-  python train.py --data_dir /path/to/BraTS --epochs 50 --batch_size 4
+Automatically downloads the BraTS 2020 dataset from Kaggle via kagglehub.
+No manual dataset setup required.
 
-For pipeline testing with 4-channel synthetic data:
-  python train.py --synthetic --epochs 5
+Usage:
+  python train.py                         # auto-downloads BraTS, trains, saves weights
+  python train.py --epochs 100            # custom epochs
+  python train.py --data_dir /my/brats    # use local dataset instead of downloading
 """
 
 import argparse
 import os
-import random
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from torch.utils.data import DataLoader
 
-from model import MultiPathFusionNet, CombinedLoss, compute_all_dice, dice_score
+from model import MultiPathFusionNet, CombinedLoss, compute_all_dice
+from dataset import BraTSDataset, find_brats_training_dir
+
+# ─────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────
+KAGGLE_DATASET = "awsaf49/brats20-dataset-training-validation"
+DEFAULT_DATA_DIR = Path(__file__).parent / "data" / "BraTS2020"
+SAVE_DIR = Path(__file__).parent / "models"
+IMG_SIZE = 256
+VAL_SPLIT = 0.2  # 20% of patients for validation
 
 
 # ─────────────────────────────────────────────────────────────
-# 4-Channel Synthetic Dataset (for pipeline testing only)
+# Dataset download
 # ─────────────────────────────────────────────────────────────
 
-class SyntheticBraTS4ChDataset(Dataset):
+def _has_patient_dirs(path: Path) -> bool:
+    """Check if a directory contains BraTS patient subdirectories."""
+    if not path.is_dir():
+        return False
+    for child in path.iterdir():
+        if child.is_dir() and (
+            list(child.glob("*_t1.nii*")) or list(child.glob("*_t1.nii.gz"))
+        ):
+            return True
+    return False
+
+
+def download_brats_dataset() -> Path:
     """
-    Generates 4-channel synthetic brain MRI slices with segmentation masks
-    for pipeline testing. Produces tensors matching the real BraTS format:
-      image: (4, 256, 256) — simulating T1, T1ce, T2, FLAIR
-      mask:  (256, 256) — classes {0, 1, 2, 3}
+    Download BraTS 2020 dataset via kagglehub if not already present.
+    Returns the path to the directory containing patient folders.
     """
+    # Check if data already exists in backend/data/BraTS2020
+    if DEFAULT_DATA_DIR.exists():
+        try:
+            root = find_brats_training_dir(str(DEFAULT_DATA_DIR))
+            print(f"✓ Dataset already exists at {root}")
+            return root
+        except FileNotFoundError:
+            pass
 
-    def __init__(self, n_samples: int = 200, img_size: int = 256):
-        self.n = n_samples
-        self.sz = img_size
+    import kagglehub
 
-    def __len__(self) -> int:
-        return self.n
+    print(f"📦 Downloading BraTS 2020 dataset from Kaggle ({KAGGLE_DATASET})...")
+    print("   This may take several minutes on first run.")
+    downloaded_path = Path(kagglehub.dataset_download(KAGGLE_DATASET))
+    print(f"✓ Downloaded to {downloaded_path}")
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        rng = np.random.RandomState(idx)
-        h = w = self.sz
+    # Find the training data root within the download
+    training_root = find_brats_training_dir(str(downloaded_path))
+    print(f"✓ Found training data at {training_root}")
 
-        mask = np.zeros((h, w), dtype=np.int64)
-        Y, X = np.ogrid[:h, :w]
-        cy = h // 2 + rng.randint(-10, 11)
-        cx = w // 2 + rng.randint(-10, 11)
+    # Create a symlink at backend/data/BraTS2020 for convenience
+    DEFAULT_DATA_DIR.parent.mkdir(parents=True, exist_ok=True)
+    if not DEFAULT_DATA_DIR.exists():
+        try:
+            DEFAULT_DATA_DIR.symlink_to(training_root)
+            print(f"✓ Linked {DEFAULT_DATA_DIR} → {training_root}")
+        except OSError:
+            # Symlink may fail on some systems; that's fine, we use the path directly
+            pass
 
-        # Brain region
-        brain = ((X - cx) ** 2 / 85**2 + (Y - cy) ** 2 / 100**2) <= 1.0
-
-        # Tumor parameters
-        tx = cx + rng.randint(-25, 26)
-        ty = cy + rng.randint(-25, 26)
-        s = rng.uniform(0.6, 1.4)
-
-        wt = (((X - tx) ** 2 / (45*s)**2 + (Y - ty)**2 / (50*s)**2) <= 1.0) & brain
-        tc = (((X - tx)**2 / (25*s)**2 + (Y - ty)**2 / (28*s)**2) <= 1.0) & wt
-        etx, ety = tx + rng.randint(-5, 6), ty + rng.randint(-5, 6)
-        et = (((X - etx)**2 / (12*s)**2 + (Y - ety)**2 / (13*s)**2) <= 1.0) & tc
-
-        mask[wt] = 1
-        mask[tc] = 2
-        mask[et] = 3
-
-        # Generate 4 modality channels with slightly different intensity profiles
-        channels = []
-        for mod_idx in range(4):
-            img = np.zeros((h, w), dtype=np.float32)
-            base_offset = mod_idx * 0.05
-            img[brain] = rng.uniform(0.3 + base_offset, 0.5 + base_offset, int(brain.sum()))
-
-            wm = ((X - cx) ** 2 / 70**2 + (Y - cy) ** 2 / 85**2) <= 1.0
-            img[wm] = rng.uniform(0.5 + base_offset, 0.7 + base_offset, int(wm.sum()))
-
-            img[wt] = rng.uniform(0.65 + base_offset, 0.8 + base_offset, int(wt.sum()))
-            img[tc] = rng.uniform(0.78 + base_offset, 0.9 + base_offset, int(tc.sum()))
-            img[et] = rng.uniform(0.88, 1.0, int(et.sum()))
-
-            img += rng.normal(0, 0.02, (h, w)).astype(np.float32)
-            img = np.clip(img, 0, 1)
-            channels.append(img)
-
-        img_t = torch.from_numpy(np.stack(channels, axis=0))  # (4, H, W)
-        mask_t = torch.from_numpy(mask)                         # (H, W)
-        return img_t, mask_t
+    return training_root
 
 
 # ─────────────────────────────────────────────────────────────
@@ -99,39 +94,55 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Dataset
-    if args.synthetic:
-        train_ds = SyntheticBraTS4ChDataset(n_samples=400, img_size=256)
-        val_ds   = SyntheticBraTS4ChDataset(n_samples=80,  img_size=256)
-        print(f"Using 4-channel synthetic dataset for pipeline testing: "
-              f"{len(train_ds)} train / {len(val_ds)} val")
+    # ── Resolve dataset path ─────────────────────────────────
+    if args.data_dir:
+        data_root = find_brats_training_dir(args.data_dir)
+        print(f"Using local dataset: {data_root}")
     else:
-        from dataset import BraTSDataset
-        if not args.data_dir:
-            raise ValueError(
-                "BraTS data directory required. Use --data_dir /path/to/BraTS "
-                "or --synthetic for pipeline testing."
-            )
-        train_ds = BraTSDataset(data_dir=args.data_dir, img_size=256)
-        val_ds   = BraTSDataset(data_dir=args.data_dir, img_size=256, slices_per_volume=5)
-        print(f"Using BraTS dataset: {len(train_ds)} train / {len(val_ds)} val")
+        data_root = download_brats_dataset()
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
+    # ── Discover patients and split into train/val ───────────
+    patient_dirs = sorted([
+        d for d in Path(data_root).iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+    ])
+    n_patients = len(patient_dirs)
+    n_val = max(1, int(n_patients * VAL_SPLIT))
+    n_train = n_patients - n_val
 
-    # Model — 4 input channels for T1, T1ce, T2, FLAIR
+    train_indices = list(range(n_train))
+    val_indices = list(range(n_train, n_patients))
+    print(f"Patients: {n_patients} total → {n_train} train / {n_val} val")
+
+    # ── Create datasets ──────────────────────────────────────
+    train_ds = BraTSDataset(
+        data_dir=str(data_root),
+        img_size=IMG_SIZE,
+        patient_indices=train_indices,
+    )
+    val_ds = BraTSDataset(
+        data_dir=str(data_root),
+        img_size=IMG_SIZE,
+        patient_indices=val_indices,
+        slices_per_volume=5,
+    )
+    print(f"Samples: {len(train_ds)} train / {len(val_ds)} val")
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    # ── Model — 4 input channels for T1, T1ce, T2, FLAIR ────
     model = MultiPathFusionNet(in_channels=4, num_classes=4).to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {params:,}")
 
-    # Optimizer + LR scheduler
+    # ── Optimizer + LR scheduler ─────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = CombinedLoss(alpha=0.5)
 
     best_dice = 0.0
-    save_dir = Path(__file__).parent / "models"
-    save_dir.mkdir(exist_ok=True)
+    SAVE_DIR.mkdir(exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):
         # ── Train ────────────────────────────────────────────
@@ -154,22 +165,22 @@ def train(args):
 
         # ── Validate ─────────────────────────────────────────
         model.eval()
-        val_dice = {"whole_tumor": 0, "tumor_core": 0, "enhancing_tumor": 0}
-        n_val = 0
+        val_dice = {"whole_tumor": 0.0, "tumor_core": 0.0, "enhancing_tumor": 0.0}
+        n_val_samples = 0
 
         with torch.no_grad():
             for imgs, masks in val_loader:
                 imgs = imgs.to(device)
                 pred_logits = model(imgs)
-                pred_masks  = pred_logits.argmax(dim=1).cpu()
+                pred_masks = pred_logits.argmax(dim=1).cpu()
                 for i in range(imgs.size(0)):
                     d = compute_all_dice(pred_masks[i], masks[i])
                     for k in val_dice:
                         val_dice[k] += d[k]
-                    n_val += 1
+                    n_val_samples += 1
 
         for k in val_dice:
-            val_dice[k] /= max(n_val, 1)
+            val_dice[k] /= max(n_val_samples, 1)
 
         avg_val_dice = sum(val_dice.values()) / 3
         elapsed = time.time() - t0
@@ -182,10 +193,10 @@ def train(args):
             f"Avg: {avg_val_dice:.1f}% | {elapsed:.1f}s"
         )
 
-        # Save best model
+        # ── Save best model ──────────────────────────────────
         if avg_val_dice > best_dice:
             best_dice = avg_val_dice
-            path = save_dir / "best_model.pth"
+            path = SAVE_DIR / "best_model.pth"
             torch.save({
                 "epoch": epoch,
                 "model_state": model.state_dict(),
@@ -195,6 +206,7 @@ def train(args):
             print(f"  ✓ Best model saved (avg Dice: {best_dice:.1f}%) → {path}")
 
     print(f"\nTraining complete. Best Avg Dice: {best_dice:.1f}%")
+    print(f"Model weights saved to: {SAVE_DIR / 'best_model.pth'}")
     print("Reference target (Wu et al. 2023): WT≥90%, TC≥90%, ET≥85%")
 
 
@@ -204,19 +216,11 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MPFNet for Brain Tumor Segmentation")
-    parser.add_argument("--data_dir",   type=str, default=None,
-                        help="Path to BraTS training data directory")
-    parser.add_argument("--synthetic",  action="store_true", default=False,
-                        help="Use 4-channel synthetic data for pipeline testing")
-    parser.add_argument("--epochs",     type=int, default=50)
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Path to local BraTS data (skips Kaggle download)")
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr",         type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
-
-    if not args.synthetic and not args.data_dir:
-        print("ERROR: No data directory specified. Use --data_dir or --synthetic.")
-        print("  For real training: python train.py --data_dir /path/to/BraTS")
-        print("  For pipeline test: python train.py --synthetic --epochs 5")
-        exit(1)
 
     train(args)

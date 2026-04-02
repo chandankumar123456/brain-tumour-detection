@@ -26,16 +26,7 @@ fi
 
 echo "📦 Installing Python dependencies..."
 "$PIP" install --quiet --upgrade pip
-"$PIP" install --quiet \
-  fastapi \
-  "uvicorn[standard]" \
-  python-multipart \
-  torch \
-  Pillow \
-  numpy \
-  reportlab \
-  scipy \
-  pydantic
+"$PIP" install --quiet -r "$BACKEND_DIR/requirements.txt"
 
 echo "✅ Dependencies installed."
 
@@ -46,13 +37,22 @@ cd "$BACKEND_DIR"
 "$PYTHON" -c "
 from model import MultiPathFusionNet
 import torch
-m = MultiPathFusionNet(in_channels=1, num_classes=4)
-x = torch.randn(1, 1, 256, 256)
+m = MultiPathFusionNet(in_channels=4, num_classes=4)
+x = torch.randn(1, 4, 256, 256)
 y = m(x)
 params = sum(p.numel() for p in m.parameters())
 print(f'  ✓ Model OK — Input: {tuple(x.shape)} → Output: {tuple(y.shape)}')
 print(f'  ✓ Parameters: {params:,}')
 "
+
+# ── Check for trained weights ────────────────────────────────
+echo ""
+if [ -f "$BACKEND_DIR/models/best_model.pth" ]; then
+  echo "✅ Trained weights found at backend/models/best_model.pth"
+else
+  echo "⚠️  No trained weights found. Run 'python train.py' first to train the model."
+  echo "   The API will return an error until weights are available."
+fi
 
 echo ""
 echo "🚀 Starting FastAPI server..."
